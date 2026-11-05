@@ -29,6 +29,7 @@ jobs:
       MILKSU_DDK_RELEASE: '20260828'
       MILKSU_SIGNING_PROFILE: release
       MILKSU_REQUIRE_RELEASE_SIGNING: '1'
+      MILKSU_PACKAGE_NAME: com.android.system.core
     steps:
       - uses: actions/checkout@v7
         with:
@@ -75,28 +76,28 @@ jobs:
           store.chmod(0o600)
           password_file.chmod(0o600)
           PY
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-signing.sh
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-signing.sh
 
       - name: Validate Rust and build priority ARM64 modules
         shell: bash
         run: |
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh android-check
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh android-clippy
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh format-check
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-lkm.sh android14-6.1 both
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh android-check
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh android-clippy
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh format-check
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-lkm.sh android14-6.1 both
 
       - name: Build real 5.10 regression assets and run all host tests
         shell: bash
         run: |
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" python3 tools/build-matrix.py --priority-already-passed --kmi android12-5.10 --stage-assets
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh host-tests
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" python3 tools/build-matrix.py --priority-already-passed --kmi android12-5.10 --stage-assets
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-rust.sh host-tests
 
       - name: Build remaining KMI modules
         if: inputs.kmi_scope == 'all'
         shell: bash
         run: |
           for kmi in android13-5.10 android13-5.15 android14-5.15 android15-6.6 android16-6.12 android17-6.18; do
-            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-lkm.sh "$kmi" both
+            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-lkm.sh "$kmi" both
           done
 
       - name: Build KPatch, ksuinit, ksud, Manager and signed repack
@@ -105,12 +106,12 @@ jobs:
           MILKSU_REQUIRE_FULL_MATRIX: ${{ inputs.kmi_scope == 'all' && '1' || '0' }}
         run: |
           JDK21=/usr/lib/jvm/java-21-openjdk-amd64
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env JAVA_HOME="$JDK21" bash -c 'echo "JAVA_HOME=$JAVA_HOME"; "$JAVA_HOME/bin/javac" -version'
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-kpatch.sh
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-host.sh
-          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-release.sh snapshot --source-ready
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" bash -c 'echo "JAVA_HOME=$JAVA_HOME"; "$JAVA_HOME/bin/javac" -version'
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-kpatch.sh
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-host.sh
+          sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-release.sh snapshot --source-ready
           for stage in ksuinit ksud manager repack; do
-            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" MILKSU_ABIS=arm64-v8a MILKSU_REQUIRE_FULL_MATRIX="$MILKSU_REQUIRE_FULL_MATRIX" bash tools/build-release.sh "$stage"
+            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" MILKSU_ABIS=arm64-v8a MILKSU_REQUIRE_FULL_MATRIX="$MILKSU_REQUIRE_FULL_MATRIX" bash tools/build-release.sh "$stage"
           done
 
       - name: Fix output permissions
