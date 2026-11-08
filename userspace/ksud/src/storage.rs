@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 const NOFOLLOW: i32 = 0o400_000;
 
-fn inspect_directories(path: &Path) -> Result<()> {
+fn inspect_directories(path: &Path, working_directory: Option<&Path>) -> Result<()> {
     ensure!(path.is_absolute(), "KPM storage path must be absolute");
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -19,11 +19,22 @@ fn inspect_directories(path: &Path) -> Result<()> {
         );
         current.push(component);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) => ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "KPM directory is not a real directory: {}",
-                current.display()
-            ),
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() && working_directory == Some(current.as_path())
+                {
+                    let target = fs::metadata(&current)?;
+                    ensure!(
+                        target.is_dir() && target.uid() == 0 && target.mode() & 0o022 == 0,
+                        "KSU working directory must resolve to a private root-owned directory"
+                    );
+                } else {
+                    ensure!(
+                        metadata.is_dir() && !metadata.file_type().is_symlink(),
+                        "KPM directory is not a real directory: {}",
+                        current.display()
+                    );
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -57,8 +68,11 @@ fn lock(path: &Path) -> Result<File> {
 }
 
 fn migrate_kpm(source: &Path, destination: &Path) -> Result<()> {
-    inspect_directories(source)?;
-    inspect_directories(destination)?;
+    inspect_directories(source, None)?;
+    // KernelSU installations may relocate the working directory via /data/adb/ksu.
+    // Only this boundary may be a link; MilkSU's own state remains real directories.
+    let working_directory = destination.parent().and_then(Path::parent);
+    inspect_directories(destination, working_directory)?;
     let parent = destination
         .parent()
         .context("KPM directory has no parent")?;
@@ -158,6 +172,52 @@ mod tests {
             .is_err()
         );
         assert!(!temporary.path().join("ksu").exists());
+    }
+
+    #[test]
+    fn root_owned_ksu_working_directory_link_supports_existing_and_migrated_state() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let relocated = temporary.path().join("relocated");
+        fs::create_dir(&relocated).unwrap();
+        fs::set_permissions(&relocated, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&relocated, temporary.path().join("ksu")).unwrap();
+        let source = temporary.path().join("legacy/kpm");
+        let target = temporary.path().join("ksu/MilkSU/kpm");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("registry.json"), b"registry").unwrap();
+        migrate_kpm(&source, &target).unwrap();
+        migrate_kpm(&source, &target).unwrap();
+        assert_eq!(
+            fs::read(relocated.join("MilkSU/kpm/registry.json")).unwrap(),
+            b"registry"
+        );
+        assert!(
+            fs::symlink_metadata(temporary.path().join("ksu"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn writable_working_directory_link_and_linked_milksu_state_are_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("relocated");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(&target, temporary.path().join("ksu")).unwrap();
+        let source = temporary.path().join("legacy/kpm");
+        let destination = temporary.path().join("ksu/MilkSU/kpm");
+        assert!(migrate_kpm(&source, &destination).is_err());
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let elsewhere = temporary.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, target.join("MilkSU")).unwrap();
+        assert!(migrate_kpm(&source, &destination).is_err());
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
     }
 
     #[test]

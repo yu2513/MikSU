@@ -15,10 +15,12 @@
 #include "klog.h" // IWYU pragma: keep
 #include "manager/manager_identity.h"
 #include "manager/throne_tracker.h"
+#include "uapi/supercall.h"
 
 static DEFINE_MUTEX(throne_tracker_mutex);
 
 uid_t ksu_manager_appid = KSU_INVALID_APPID;
+uid_t ksu_hidden_manager_appid = KSU_INVALID_APPID;
 
 #define DATA_PATH_LEN 384 // 384 is enough for /data/app/<package>/base.apk
 
@@ -32,18 +34,16 @@ struct uid_data {
     char package[KSU_MAX_PACKAGE_NAME];
 };
 
-static void crown_manager(const char *apk, struct list_head *uid_data)
+static uid_t manager_uid(const char *package, struct list_head *uid_data)
 {
     struct list_head *list = (struct list_head *)uid_data;
     struct uid_data *np;
 
     list_for_each_entry (np, list, list) {
-        if (strncmp(np->package, KSU_PACKAGE_NAME, KSU_MAX_PACKAGE_NAME) == 0) {
-            pr_info("Crowning manager: uid=%d\n", np->uid);
-            ksu_set_manager_appid(np->uid);
-            break;
-        }
+        if (!strcmp(np->package, package))
+            return np->uid;
     }
+    return KSU_INVALID_APPID;
 }
 
 struct data_path {
@@ -58,6 +58,8 @@ struct my_dir_context {
     char *parent_dir;
     void *private_data;
     int depth;
+    const char *package;
+    bool hidden;
 };
 // https://docs.kernel.org/filesystems/porting.html
 // filldir_t (readdir callbacks) calling conventions have changed. Instead of returning 0 or -E... it returns bool now. false means "no more" (as -E... used to) and true - "keep going" (as 0 in old calling conventions). Rationale: callers never looked at specific -E... values anyway. -> iterate_shared() instances require no changes at all, all filldir_t ones in the tree converted.
@@ -71,7 +73,7 @@ struct my_dir_context {
 #define FILLDIR_ACTOR_STOP -EINVAL
 #endif
 
-static bool maybe_manager_apk_dir(const char *path)
+static bool maybe_manager_apk_dir(const char *path, const char *package)
 {
     _Static_assert(sizeof(KSU_PACKAGE_NAME) < KSU_MAX_PACKAGE_NAME, "KSU_PACKAGE_NAME too long!");
     char pkg[KSU_MAX_PACKAGE_NAME];
@@ -81,7 +83,7 @@ static bool maybe_manager_apk_dir(const char *path)
     }
 
     // pkg is `<real package>`
-    return strncmp(pkg, KSU_PACKAGE_NAME, sizeof(KSU_PACKAGE_NAME)) == 0;
+    return !strcmp(pkg, package);
 }
 
 static FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name, int namelen, loff_t off, u64 ino,
@@ -124,9 +126,8 @@ static FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name, i
 
     // now put this on candidate_path
     if (d_type == DT_REG && namelen == 8 && !memcmp(name, "base.apk", 8)) {
-        if (maybe_manager_apk_dir(my_ctx->parent_dir)) {
+        if (maybe_manager_apk_dir(my_ctx->parent_dir, my_ctx->package)) {
             snprintf(candidate_path, DATA_PATH_LEN, "%s/%.*s", my_ctx->parent_dir, namelen, name);
-            strcpy(cached_manager_apk_path, candidate_path);
         }
         // As soon as we met the base.apk, we can stop
         return FILLDIR_ACTOR_STOP;
@@ -135,8 +136,11 @@ static FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name, i
     return FILLDIR_ACTOR_CONTINUE;
 }
 
-static void search_manager(const char *path, int depth, struct list_head *uid_data)
+static uid_t search_manager(const char *path, int depth, struct list_head *uid_data,
+                            const struct ksu_manager_identity_record *identity)
 {
+    uid_t result = KSU_INVALID_APPID;
+    const char *package = identity ? identity->package : KSU_PACKAGE_NAME;
     int i, stop = 0;
     struct list_head data_path_list;
     INIT_LIST_HEAD(&data_path_list);
@@ -162,6 +166,8 @@ static void search_manager(const char *path, int depth, struct list_head *uid_da
                                           .data_path_list = &data_path_list,
                                           .parent_dir = pos->dirpath,
                                           .private_data = candidate_path,
+                                          .package = package,
+                                          .hidden = identity != NULL,
                                           .depth = pos->depth };
             struct file *file = ksu_filp_open_nonotify(pos->dirpath, O_RDONLY | O_NOFOLLOW | O_NOATIME | O_DIRECTORY);
             if (IS_ERR(file)) {
@@ -193,17 +199,20 @@ static void search_manager(const char *path, int depth, struct list_head *uid_da
             if (!candidate_path[0])
                 goto skip_iterate;
 
-            // As soon as we get the manager apk path, we can stop
-            stop = 1;
-
-            bool is_manager = is_manager_apk(candidate_path);
+            bool is_manager = identity ? ksu_apk_matches_certificate(candidate_path,
+                identity->certificate_size, identity->certificate_sha256) : is_manager_apk(candidate_path);
             pr_info("Found manager base.apk at path: %s, is_manager: %d\n", candidate_path, is_manager);
 
             // Only crown if signature verification pass
-            if (unlikely(!is_manager))
+            if (unlikely(!is_manager)) {
+                candidate_path[0] = 0;
                 goto skip_iterate;
+            }
 
-            crown_manager(candidate_path, uid_data);
+            stop = 1;
+            result = manager_uid(package, uid_data);
+            if (!identity && result != KSU_INVALID_APPID)
+                strscpy(cached_manager_apk_path, candidate_path, sizeof(cached_manager_apk_path));
 
         skip_iterate:
             list_del(&pos->list);
@@ -211,6 +220,73 @@ static void search_manager(const char *path, int depth, struct list_head *uid_da
                 kfree(pos);
         }
     }
+    return result;
+}
+
+static bool read_hidden_identity(const char *package, struct ksu_manager_identity_record *record)
+{
+    struct ksu_manager_identity_record identity;
+    char path[DATA_PATH_LEN];
+    loff_t offset = 0;
+    int i;
+    bool valid = false;
+    if (snprintf(path, sizeof(path), "/data/user_de/0/%s/files/.manager-identity", package) >= sizeof(path))
+        return false;
+    struct file *file = ksu_filp_open_nonotify(path, O_RDONLY | O_NOFOLLOW | O_NOATIME | O_NONBLOCK);
+    if (IS_ERR(file))
+        goto out;
+    struct inode *inode = file_inode(file);
+    if (!S_ISREG(inode->i_mode) || inode->i_uid.val != 0 || inode->i_gid.val != 0 ||
+        (inode->i_mode & 07777) != 0600 || inode->i_nlink != 1 ||
+        i_size_read(inode) != sizeof(identity))
+        goto close;
+    if (kernel_read(file, &identity, sizeof(identity), &offset) != sizeof(identity) ||
+        identity.magic != KSU_MANAGER_IDENTITY_MAGIC || identity.version != KSU_MANAGER_IDENTITY_VERSION ||
+        identity.certificate_size < 1 || identity.certificate_size > 1024 ||
+        !identity.package[0] || identity.package[255] || identity.certificate_sha256[64])
+        goto close;
+    bool dot = false;
+    for (i = 0; identity.package[i]; i++) {
+        char c = identity.package[i];
+        if (c == '.') {
+            if (i == 0 || identity.package[i - 1] == '.' || !identity.package[i + 1])
+                goto close;
+            dot = true;
+        } else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
+            goto close;
+        } else if ((i == 0 || identity.package[i - 1] == '.') && !(c >= 'a' && c <= 'z')) {
+            goto close;
+        }
+    }
+    if (!dot || strcmp(identity.package, package) || !strcmp(identity.package, KSU_PACKAGE_NAME))
+        goto close;
+    for (i = 0; i < 64; i++) {
+        char c = identity.certificate_sha256[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            goto close;
+    }
+    valid = true;
+    *record = identity;
+close:
+    filp_close(file, NULL);
+out:
+    return valid;
+}
+
+static void refresh_hidden_manager(struct list_head *uid_data)
+{
+    struct uid_data *entry;
+    struct ksu_manager_identity_record identity;
+    uid_t appid = KSU_INVALID_APPID;
+    list_for_each_entry(entry, uid_data, list) {
+        if (entry->uid >= 10000 && entry->uid < KSU_PER_USER_RANGE &&
+            read_hidden_identity(entry->package, &identity)) {
+            appid = search_manager("/data/app", 2, uid_data, &identity);
+            if (appid != KSU_INVALID_APPID)
+                break;
+        }
+    }
+    WRITE_ONCE(ksu_hidden_manager_appid, appid);
 }
 
 static bool is_uid_exist(uid_t uid, char *package, void *data)
@@ -228,13 +304,15 @@ static bool is_uid_exist(uid_t uid, char *package, void *data)
     return exist;
 }
 
-void track_throne(bool prune_only)
+int track_throne(bool prune_only)
 {
+    int result = 0;
     mutex_lock(&throne_tracker_mutex);
     const struct cred *old_cred = override_creds(ksu_cred);
     struct file *fp = filp_open(SYSTEM_PACKAGES_LIST_PATH, O_RDONLY, 0);
     if (IS_ERR(fp)) {
         pr_err("%s: open " SYSTEM_PACKAGES_LIST_PATH " failed: %ld\n", __func__, PTR_ERR(fp));
+        result = PTR_ERR(fp);
         goto out_revert_cred;
     }
 
@@ -247,13 +325,17 @@ void track_throne(bool prune_only)
     char buf[KSU_MAX_PACKAGE_NAME];
     for (;;) {
         ssize_t count = kernel_read(fp, &chr, sizeof(chr), &pos);
-        if (count != sizeof(chr))
+        if (count != sizeof(chr)) {
+            if (count < 0)
+                result = count;
             break;
+        }
         if (chr != '\n')
             continue;
 
         count = kernel_read(fp, buf, sizeof(buf) - 1, &line_start);
         if (count <= 0) {
+            result = count < 0 ? count : -EIO;
             break;
         }
         buf[count] = '\0';
@@ -261,6 +343,7 @@ void track_throne(bool prune_only)
         struct uid_data *data = kzalloc(sizeof(struct uid_data), GFP_KERNEL);
         if (!data) {
             filp_close(fp, 0);
+            result = -ENOMEM;
             goto out;
         }
 
@@ -271,6 +354,7 @@ void track_throne(bool prune_only)
         if (!uid || !package) {
             kfree(data);
             pr_err("update_uid: package or uid is NULL!\n");
+            result = -EINVAL;
             break;
         }
 
@@ -278,6 +362,7 @@ void track_throne(bool prune_only)
         if (kstrtou32(uid, 10, &res)) {
             kfree(data);
             pr_err("update_uid: uid parse err\n");
+            result = -EINVAL;
             break;
         }
         data->uid = res;
@@ -287,6 +372,8 @@ void track_throne(bool prune_only)
         line_start = pos;
     }
     filp_close(fp, 0);
+    if (result)
+        goto out;
 
     // now update uid list
     struct uid_data *np;
@@ -295,6 +382,7 @@ void track_throne(bool prune_only)
     if (prune_only)
         goto prune;
 
+    refresh_hidden_manager(&uid_list);
     // first, check if manager_uid exist!
     uid_t manager_package_uid = KSU_INVALID_APPID;
     bool need_rescan = false;
@@ -307,15 +395,15 @@ void track_throne(bool prune_only)
 
     if (manager_package_uid == KSU_INVALID_APPID) {
         cached_manager_apk_path[0] = 0;
-        if (ksu_is_manager_appid_valid()) {
+        if (READ_ONCE(ksu_manager_appid) != KSU_INVALID_APPID) {
             pr_info("manager is uninstalled, invalidate it!\n");
             ksu_invalidate_manager_uid();
             goto prune;
         }
     } else {
-        if (!ksu_is_manager_appid_valid()) {
+        if (READ_ONCE(ksu_manager_appid) == KSU_INVALID_APPID) {
             need_rescan = true;
-        } else if (unlikely(np->uid != ksu_get_manager_appid())) {
+        } else if (unlikely(np->uid != READ_ONCE(ksu_manager_appid))) {
             // this should not happen in normal android system
             pr_info("manager uid changed, invalidate it!\n");
             cached_manager_apk_path[0] = 0;
@@ -329,7 +417,7 @@ void track_throne(bool prune_only)
 
     if (need_rescan) {
         // If the apk path still exists, the verification result won't be changed
-        if (cached_manager_apk_path[0]) {
+        if (cached_manager_apk_path[0] && READ_ONCE(ksu_manager_appid) != KSU_INVALID_APPID) {
             struct path p;
             int ret = kern_path(cached_manager_apk_path, 0, &p);
             if (ret == 0) {
@@ -342,7 +430,7 @@ void track_throne(bool prune_only)
             }
         }
         pr_info("Searching manager " KSU_PACKAGE_NAME "...\n");
-        search_manager("/data/app", 2, &uid_list);
+        ksu_set_manager_appid(search_manager("/data/app", 2, &uid_list, NULL));
         pr_info("Search manager finished\n");
     }
 
@@ -358,6 +446,7 @@ out:
 out_revert_cred:
     revert_creds(old_cred);
     mutex_unlock(&throne_tracker_mutex);
+    return result;
 }
 
 void __init ksu_throne_tracker_init()

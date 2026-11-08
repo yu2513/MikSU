@@ -18,6 +18,7 @@
 #include "runtime/ksud_boot.h"
 #include "feature/kernel_umount.h"
 #include "manager/manager_identity.h"
+#include "manager/throne_tracker.h"
 #include "selinux/selinux.h"
 #include "infra/file_wrapper.h"
 #include "hook/tp_marker.h"
@@ -69,6 +70,10 @@ static int do_get_info(void __user *arg)
     cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
 #endif
     cmd.features = KSU_FEATURE_MAX;
+#ifndef CONFIG_KSU_DISABLE_MANAGER
+    if (is_manager())
+        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER_HIDE;
+#endif
     cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
@@ -340,6 +345,13 @@ static int do_get_manager_appid(void __user *arg)
 {
     struct ksu_get_manager_appid_cmd cmd;
 
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+    if (cmd.appid == KSU_MANAGER_REFRESH_REQUEST) {
+        int ret = track_throne(false);
+        if (ret)
+            return ret;
+    }
     cmd.appid = ksu_get_manager_appid();
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
@@ -816,13 +828,15 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_GET_INFO,
         .name = "GET_INFO",
         .handler = do_get_info,
-        .perm_check = always_allow
+        .perm_check = allowed_for_driver,
+        .allow_su_session = true
     },
     {
         .cmd = KSU_IOCTL_GET_INFO_LEGACY,
         .name = "GET_INFO_LEGACY",
         .handler = do_get_info_legacy,
-        .perm_check = always_allow
+        .perm_check = allowed_for_driver,
+        .allow_su_session = true
     },
     {
         .cmd = KSU_IOCTL_REPORT_EVENT,
@@ -840,7 +854,8 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_CHECK_SAFEMODE,
         .name = "CHECK_SAFEMODE",
         .handler = do_check_safemode,
-        .perm_check = always_allow
+        .perm_check = allowed_for_driver,
+        .allow_su_session = true
     },
     {
         .cmd = KSU_IOCTL_GET_ALLOW_LIST,

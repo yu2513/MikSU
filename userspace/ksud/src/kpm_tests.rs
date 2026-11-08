@@ -559,6 +559,44 @@ fn capability_probe_keeps_zero_distinct_from_query_failure() {
 }
 
 #[test]
+fn standard_kpatch_next_without_capability_extension_is_usable() {
+    let probe = runtime::probe_with(|command| match command {
+        0x1000 => Ok(0x2026_2026),
+        0x1008 => Ok(0x0d05),
+        0x1033 => Err(std::io::Error::from_raw_os_error(libc::ENOSYS).into()),
+        _ => panic!("unexpected command"),
+    });
+    assert!(probe.upstream && probe.managed() && probe.can_unload());
+    assert!(probe.error.is_none());
+    assert!(probe.capabilities.is_none());
+    assert!(require_engine(&probe).is_ok());
+    // Upstream installs SELinux hooks, so AVC spoofing must still avoid them.
+    assert!(probe.avc_conflict());
+    let transition = json!({
+        "configured_enabled": true, "reboot_required": false,
+        "can_configure": true, "reason": null,
+    });
+    let status = status_value(&probe, &transition, true, true).unwrap();
+    assert_eq!(status["provider"], "kpatch-next");
+    assert_eq!(status["supported"], true);
+    assert_eq!(status["runtime_supported"], true);
+    assert!(status["probe_error"].is_null());
+}
+
+#[test]
+fn capability_permission_failure_never_enables_standard_engine_fallback() {
+    let probe = runtime::probe_with(|command| match command {
+        0x1000 => Ok(0x2026_2026),
+        0x1008 => Ok(0x0d05),
+        0x1033 => Err(std::io::Error::from_raw_os_error(libc::EPERM).into()),
+        _ => panic!("unexpected command"),
+    });
+    assert!(!probe.upstream);
+    assert!(!probe.managed());
+    assert!(probe.error.is_some());
+}
+
+#[test]
 fn capability_superset_is_required_even_when_upgrade_is_available() {
     let transition = json!({
         "configured_enabled": true, "reboot_required": true,

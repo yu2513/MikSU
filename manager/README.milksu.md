@@ -4,7 +4,22 @@ MilkSU Manager provides Root authorization, application profiles, module
 management, KPM controls and SUSFS settings.
 
 Application ID: `io.milksu.manager`.
-Kotlin, JNI and AIDL namespace: `me.weishu.kernelsu`.
+Kotlin, JNI and AIDL namespace: `io.milksu.manager`.
+
+The application ID is MilkSU's installed identity and must match
+`KSU_PACKAGE_NAME` in the kernel and signing metadata. Builds reject upstream
+KernelSU/KernelSU-Next application IDs. Keep the MilkSU application ID and
+signing certificate stable for updates.
+
+Kotlin/Java classes, JNI symbols, AIDL descriptors, manifest components and the
+daemon's explicit launch component all use the MilkSU namespace. The installed
+application ID and signing certificate remain unchanged by this code migration.
+Hidden Manager packages retain the MilkSU class names while their installed
+identity is rewritten.
+
+KernelSU-compatible paths and protocols, including `/data/adb/ksu`, the driver
+descriptor, module variables and WebUI interfaces, remain stable so existing
+profiles, modules and tools keep working.
 
 ## Build
 

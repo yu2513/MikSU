@@ -234,6 +234,8 @@ enum BootInfo {
 
 #[derive(clap::Subcommand, Debug)]
 enum Debug {
+    RefreshManager,
+
     /// Set the manager app, kernel CONFIG_KSU_DEBUG should be enabled.
     SetManager {
         /// manager package name
@@ -496,6 +498,9 @@ enum Feature {
         id: String,
         /// Feature value (0=disable, 1=enable)
         value: u64,
+        /// Set and save the value while holding the feature configuration lock
+        #[arg(long)]
+        persist: bool,
     },
 
     /// List all available features
@@ -780,7 +785,13 @@ pub fn run() -> Result<()> {
                     crate::feature::get_feature(&id)
                 }
             }
-            Feature::Set { id, value } => crate::feature::set_feature(&id, value),
+            Feature::Set { id, value, persist } => {
+                if persist {
+                    crate::feature::set_persistent_feature(&id, value)
+                } else {
+                    crate::feature::set_feature(&id, value)
+                }
+            }
             Feature::List => {
                 crate::feature::list_features();
                 Ok(())
@@ -791,6 +802,10 @@ pub fn run() -> Result<()> {
         },
 
         Commands::Debug { command } => match command {
+            Debug::RefreshManager => {
+                utils::switch_mnt_ns(1).context("Cannot enter the system mount namespace")?;
+                ksucalls::refresh_manager_identity()
+            }
             Debug::SetManager { apk } => debug::set_manager(&apk),
             Debug::GetSign { apk } => {
                 let sign = apk_sign::get_apk_signature(&apk)?;

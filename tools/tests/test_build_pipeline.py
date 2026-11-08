@@ -34,6 +34,7 @@ def sha(data):
 
 def elf(label):
     data = bytearray(b"\x7fELF" + b"\0" * 20)
+    data[4:6] = b"\x02\x01"
     data[18:20] = (183).to_bytes(2, "little")
     return bytes(data) + label.encode()
 
@@ -107,10 +108,56 @@ class BuildVerifyTests(TemporaryAssets):
     def write_embedded(self, assets):
         self.put_json("out/manifests/embedded-assets-aarch64.json", assets)
 
+    def add_x86_daemon(self, machine=62):
+        daemon = bytearray(elf("x86-daemon"))
+        daemon[18:20] = machine.to_bytes(2, "little")
+        self.put("out/ksud/x86_64/ksud", daemon)
+        with zipfile.ZipFile(self.apk, "a") as archive:
+            archive.writestr("lib/x86_64/libksud.so", daemon)
+            for library in ("libkernelsu.so", "libadbroot.so"):
+                archive.writestr(f"lib/x86_64/{library}", daemon)
+        return bytes(daemon)
+
+    def test_verifies_every_packaged_daemon_abi(self):
+        daemon = self.add_x86_daemon()
+        self.environment["MILKSU_ABIS"] = "arm64-v8a x86_64"
+        self.verify()
+        self.assertEqual(self.read_json("out/manifests/final-apk.json")["native_daemons"],
+                         {"arm64-v8a": sha(self.daemon), "x86_64": sha(daemon)})
+
+    def test_rejects_missing_requested_abi(self):
+        self.environment["MILKSU_ABIS"] = "arm64-v8a x86_64"
+        with self.assertRaisesRegex(SystemExit, "daemon ABIs differ"):
+            self.verify()
+
+    def test_rejects_wrong_machine_in_x86_daemon(self):
+        self.add_x86_daemon(machine=183)
+        with self.assertRaisesRegex(SystemExit, "wrong ELF machine"):
+            self.verify()
+
+    def test_rejects_stale_x86_daemon(self):
+        self.add_x86_daemon()
+        self.put("out/ksud/x86_64/ksud", elf("stale"))
+        with self.assertRaisesRegex(SystemExit, "release daemon: x86_64"):
+            self.verify()
+
+    def test_rejects_missing_x86_bridge_even_when_daemon_is_present(self):
+        self.add_x86_daemon()
+        with zipfile.ZipFile(self.apk) as archive:
+            entries = [(item.filename, archive.read(item)) for item in archive.infolist()
+                       if item.filename != "lib/x86_64/libkernelsu.so"]
+        with zipfile.ZipFile(self.apk, "w") as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        with self.assertRaisesRegex(SystemExit, "missing a native library"):
+            self.verify()
+
     def write_apk(self, daemon):
         self.apk.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(self.apk, "w") as archive:
             archive.writestr("lib/arm64-v8a/libksud.so", daemon)
+            for library in ("libkernelsu.so", "libadbroot.so"):
+                archive.writestr(f"lib/arm64-v8a/{library}", self.daemon)
             archive.writestr("AndroidManifest.xml", b"synthetic-manifest")
 
     def run_modules(self, arguments, **kwargs):
@@ -161,7 +208,27 @@ class BuildVerifyTests(TemporaryAssets):
             "version_code": 32800,
             "certificate_sha256": self.certificate_hash,
             "ksud_sha256": sha(self.daemon),
+            "native_daemons": {"arm64-v8a": sha(self.daemon)},
         })
+
+    def test_upstream_manager_application_ids_cannot_be_published_as_milksu(self):
+        for package in ("me.weishu.kernelsu", "me.weishu.kernelsu.pr",
+                        "com.rifsxd.ksunext", "com.rifsxd.ksunext.debug"):
+            with self.subTest(package=package):
+                signing = self.read_json("out/private/certificate.json")
+                signing["KSU_PACKAGE_NAME"] = package
+                self.put_json("out/private/certificate.json", signing)
+                with self.assertRaisesRegex(SystemExit, "own application ID"):
+                    self.verify()
+                self.module_run.assert_not_called()
+                self.android_output.assert_not_called()
+                self.assertFalse(self.final_manifest.exists())
+
+    def test_apk_package_must_match_the_kernel_manager_identity(self):
+        self.badging = self.badging.replace("io.milksu.manager", "me.weishu.kernelsu")
+        with self.assertRaisesRegex(SystemExit, "Unexpected APK applicationId"):
+            self.verify()
+        self.assertFalse(self.final_manifest.exists())
 
     def test_partial_matrix_option_still_checks_embedded_assets(self):
         self.environment["MILKSU_REQUIRE_FULL_MATRIX"] = "0"
@@ -304,7 +371,7 @@ class BuildVerifyTests(TemporaryAssets):
         daemon[18:20] = (62).to_bytes(2, "little")
         self.put("out/ksud/arm64-v8a/ksud", daemon)
         self.write_apk(daemon)
-        with self.assertRaisesRegex(SystemExit, "not an AArch64 ELF"):
+        with self.assertRaisesRegex(SystemExit, "wrong ELF machine for arm64-v8a"):
             self.verify()
         self.assertFalse(self.final_manifest.exists())
 
@@ -428,6 +495,18 @@ class ReleaseKsudTests(TemporaryAssets):
                 arch = self.arches[abi][0]
                 self.assertEqual((self.work / f"userspace/ksud/bin/{arch}/ksuinit").read_bytes(),
                                  self.fresh[abi])
+
+    def test_x86_daemon_build_does_not_require_arm64_kernel_modules(self):
+        self.environment["MILKSU_ABIS"] = "x86_64"
+        for suffix in ("kernelsu", "susfs_guard_lkm"):
+            (self.out / f"x86_64/android14-6.1_{suffix}.ko").unlink()
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            {item["name"] for item in self.read_json("compile-inputs/x86_64.json")},
+            {"ksuinit"},
+        )
+        self.assertTrue((self.out / "ksud/x86_64/ksud").is_file())
 
     def test_missing_init_output_rejects_even_with_old_snapshot_asset(self):
         (self.out / "ksuinit/arm64-v8a/ksuinit").unlink()

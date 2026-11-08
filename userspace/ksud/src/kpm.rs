@@ -224,7 +224,7 @@ fn status_value(
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let reason = if !arm64_android {
-        Some("KPM requires Android ARM64")
+        Some("The bundled KPM engine requires an ARM64 kernel")
     } else if !root {
         Some("Root access is required to probe the KPM engine")
     } else if let Some(reason) = transition.get("reason").and_then(Value::as_str) {
@@ -252,7 +252,7 @@ fn status_value(
         "active": probe.active,
         "reboot_required": reboot_required,
         "transition_failed": transition.get("transition_failed").and_then(Value::as_bool).unwrap_or(false),
-        "provider": if probe.active && probe.error.is_some() { "unknown" } else if unmanaged { "incompatible" } else if probe.managed() { "milksu" } else { "none" },
+        "provider": if probe.active && probe.error.is_some() { "unknown" } else if probe.upstream { "kpatch-next" } else if unmanaged { "incompatible" } else if probe.managed() { "milksu" } else { "none" },
         "state_known": root && transition.get("state_known").and_then(Value::as_bool).unwrap_or(true),
         "version": probe.version,
         "capabilities": probe.capabilities,
@@ -677,11 +677,11 @@ fn execute(command: KpmCommand) -> Result<Value> {
         return status(runtime_only);
     }
     require_root()?;
-    #[cfg(target_os = "android")]
-    crate::storage::prepare_kpm()?;
     if let KpmCommand::Integration { action } = command {
         return crate::kpm_image::set_enabled(action.enabled());
     }
+    #[cfg(target_os = "android")]
+    crate::storage::prepare_kpm()?;
     let mut backend = Backend::open(Path::new(STATE_ROOT), &NativeEngine, boot_id()?)?;
     match command {
         KpmCommand::List => backend.list(),

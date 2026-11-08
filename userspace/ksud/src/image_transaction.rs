@@ -327,6 +327,7 @@ fn install_with_operations(
 ) -> Result<Receipt> {
     ensure!(!images.is_empty(), "no images to install");
     secure_dir(directory)?;
+    let directory = &directory.canonicalize()?;
     let _lock = operation_lock(directory)?;
     let pending = pending_path(directory);
     #[cfg(target_os = "android")]
@@ -736,6 +737,265 @@ fn validate_recovery(journal_path: &Path, journal: &Journal) -> Result<bool> {
 }
 
 #[cfg(any(target_os = "android", test))]
+fn read_recovery_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit,
+        "invalid recovery file: {}",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "recovery file exceeds its limit"
+    );
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn reconcile_pending(
+    pending: &Path,
+    validate: impl FnOnce(&Path, &Journal) -> Result<()>,
+) -> Result<()> {
+    let owner: PathBuf = serde_json::from_slice(&read_recovery_file(pending, 4096)?)?;
+    ensure!(owner.is_absolute(), "recovery journal path is not absolute");
+    let journal_path = owner
+        .canonicalize()
+        .context("recovery journal is missing")?;
+    ensure!(
+        journal_path == owner,
+        "recovery journal path is not canonical"
+    );
+    let mut journal: Journal =
+        serde_json::from_slice(&read_recovery_file(&journal_path, 2 * 1024 * 1024)?)?;
+    ensure!(
+        journal.version == 1
+            && !journal.entries.is_empty()
+            && journal.entries.len() <= 3
+            && journal.attempted <= journal.entries.len()
+            && journal.states.len() <= 16,
+        "invalid pending recovery journal"
+    );
+    let directory = journal_path.parent().context("journal has no parent")?;
+    ensure!(
+        pending_path(
+            directory
+                .parent()
+                .context("journal has no transaction directory")?
+        ) == pending,
+        "pending journal belongs to another operation root"
+    );
+    validate(&journal_path, &journal)?;
+    let mut before = true;
+    let mut after = true;
+    let mut targets = BTreeSet::new();
+    for (index, entry) in journal.entries.iter().enumerate() {
+        ensure!(
+            targets.insert(&entry.target),
+            "duplicate recovery partition"
+        );
+        ensure!(
+            entry.bytes > 0 && entry.bytes <= MAX_PARTITION_BYTES,
+            "invalid recovery partition size"
+        );
+        for (path, digest) in [
+            (&entry.backup, &entry.before_sha256),
+            (&entry.staged, &entry.after_sha256),
+        ] {
+            ensure!(
+                path.parent() == Some(directory) && path.canonicalize()? == *path,
+                "recovery image is outside its transaction"
+            );
+            let bytes = read_recovery_file(path, entry.bytes)?;
+            ensure!(
+                bytes.len() as u64 == entry.bytes && sha256::digest(&bytes) == *digest,
+                "recovery image size or hash does not match"
+            );
+        }
+        ensure!(
+            capacity(&entry.target)? == entry.bytes,
+            "recovery target size changed"
+        );
+        let current = sha256::digest(read_image(&entry.target)?);
+        let original = current == entry.before_sha256;
+        let candidate = current == entry.after_sha256;
+        ensure!(
+            original || candidate,
+            "pending transaction target has an unknown image; use explicit image recovery: {}",
+            entry.target.display()
+        );
+        if !matches!(journal.state.as_str(), "committed" | "rolled_back") {
+            ensure!(
+                index < journal.attempted || original,
+                "an unattempted recovery target changed"
+            );
+        }
+        before &= original;
+        after &= candidate;
+    }
+    let mut state_paths = BTreeSet::new();
+    for state in &journal.states {
+        ensure!(
+            state_paths.insert(&state.path)
+                && state.after.len() <= 64 * 1024
+                && state
+                    .before
+                    .as_ref()
+                    .is_none_or(|bytes| bytes.len() <= 64 * 1024),
+            "invalid recovery state"
+        );
+        if let Ok(metadata) = fs::symlink_metadata(&state.path) {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "recovery state is not a regular file"
+            );
+        }
+        let current = read_state_file(&state.path)?;
+        let original = current == state.before;
+        let candidate = current.as_deref() == Some(state.after.as_slice());
+        ensure!(
+            original || candidate,
+            "pending transaction state changed; use explicit image recovery: {}",
+            state.path.display()
+        );
+        before &= original;
+        after &= candidate;
+    }
+    match journal.state.as_str() {
+        "committed" => {
+            ensure!(
+                after,
+                "committed transaction no longer matches its images and state"
+            );
+            clear_pending(&journal_path)?;
+        }
+        "rolled_back" => {
+            ensure!(
+                before,
+                "rolled-back transaction no longer matches its originals"
+            );
+            clear_pending(&journal_path)?;
+        }
+        state => {
+            let writing = state
+                .strip_prefix("writing:")
+                .and_then(|index| index.parse::<usize>().ok());
+            let publishing = state
+                .strip_prefix("publishing:")
+                .and_then(|index| index.parse::<usize>().ok());
+            ensure!(
+                (state == "prepared" && journal.attempted == 0)
+                    || writing.is_some_and(
+                        |index| index < journal.entries.len() && journal.attempted == index + 1
+                    )
+                    || publishing.is_some_and(|index| index < journal.states.len()
+                        && journal.attempted == journal.entries.len())
+                    || matches!(state, "restoring" | "recovery_required"),
+                "unknown pending transaction phase"
+            );
+            if after
+                && journal.attempted == journal.entries.len()
+                && !matches!(state, "restoring" | "recovery_required")
+            {
+                journal.state = "committed".into();
+                save_journal(&journal_path, &journal)?;
+                clear_pending(&journal_path)?;
+            } else {
+                let count = journal.attempted;
+                restore(
+                    &journal_path,
+                    &mut journal,
+                    count,
+                    &mut write_image,
+                    &mut atomic_write,
+                    &mut save_journal,
+                )?;
+            }
+        }
+    }
+    log::info!(
+        "Reconciled pending image transaction: {}",
+        journal_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn recover_pending() -> Result<()> {
+    ensure!(
+        rustix::process::getuid().is_root(),
+        "image recovery requires root"
+    );
+    let pending = [IMAGE_ROOT, LEGACY_IMAGE_ROOT]
+        .iter()
+        .map(|root| Path::new(root).join("image-pending.json"))
+        .filter_map(|path| match fs::symlink_metadata(&path) {
+            Ok(_) => Some(Ok(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    ensure!(
+        pending.len() <= 1,
+        "multiple image operations need explicit recovery"
+    );
+    for pending in pending {
+        let root = pending.parent().context("pending record has no parent")?;
+        let _lock = operation_lock(root)?;
+        reconcile_pending(&pending, |path, journal| {
+            ensure!(
+                path.starts_with(root.canonicalize()?),
+                "recovery journal is outside its storage root"
+            );
+            ensure!(
+                journal.device_serial == crate::utils::getprop("ro.serialno"),
+                "recovery device does not match"
+            );
+            let slot = crate::boot_patch::get_slot_suffix(false);
+            ensure!(
+                matches!(slot.as_str(), "" | "_a" | "_b")
+                    && journal.slot.as_deref() == Some(slot.as_str()),
+                "recovery slot does not match"
+            );
+            let allowed = ["boot", "init_boot", "vendor_boot"]
+                .iter()
+                .filter_map(|name| {
+                    PathBuf::from(format!("/dev/block/by-name/{name}{slot}"))
+                        .canonicalize()
+                        .ok()
+                })
+                .collect::<BTreeSet<_>>();
+            for entry in &journal.entries {
+                ensure!(
+                    allowed.contains(&entry.target),
+                    "recovery target is not an active-slot boot partition"
+                );
+            }
+            let allowed_state = root.canonicalize()?.join("kpm/integration").join(format!(
+                "state{}.json",
+                if slot.is_empty() { "_single" } else { &slot }
+            ));
+            ensure!(
+                journal
+                    .states
+                    .iter()
+                    .all(|state| state.path == allowed_state),
+                "pending transaction contains an unknown state file"
+            );
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "Cannot recover pending image operation at {}",
+                pending.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
 fn relocated_kpm_path(path: &Path) -> Result<PathBuf> {
     use std::path::Component;
     ensure!(
@@ -1140,6 +1400,45 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(fs::read(target).unwrap(), b"another-install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_directory_alias_uses_canonical_journal_and_keeps_rollback_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("relocated");
+        fs::create_dir(&storage).unwrap();
+        let alias = root.path().join("ksu");
+        std::os::unix::fs::symlink(&storage, &alias).unwrap();
+        let target = root.path().join("boot");
+        fs::write(&target, b"old-image").unwrap();
+        let state = alias.join("MilkSU/kpm/integration/state_b.json");
+        let receipt = install_with_state(
+            "enable-kpm",
+            &[ImageWrite {
+                target: target.clone(),
+                image: b"new-image".to_vec(),
+                expected_sha256: None,
+            }],
+            &[StateWrite {
+                path: state.clone(),
+                contents: b"enabled".to_vec(),
+            }],
+            &alias.join("MilkSU/kpm/integration/transactions_b"),
+        )
+        .unwrap();
+        assert!(receipt.journal.starts_with(&storage));
+        assert_eq!(receipt.journal.canonicalize().unwrap(), receipt.journal);
+        assert_eq!(fs::read(&state).unwrap(), b"enabled");
+        rollback(&receipt).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"old-image");
+        assert!(!state.exists());
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1711,5 +2010,176 @@ mod tests {
         assert!(check_install_pending(&current, &legacy).is_err());
         assert_eq!(fs::read_link(&legacy).unwrap(), Path::new("missing-owner"));
         assert!(!current.parent().unwrap().exists());
+    }
+
+    fn pending_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Receipt) {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("boot");
+        let state = root.path().join("state.json");
+        fs::write(&target, b"image-old").unwrap();
+        fs::write(&state, b"disabled").unwrap();
+        let receipt = install_with_state(
+            "enable-kpm",
+            &[ImageWrite {
+                target: target.clone(),
+                image: b"image-new".to_vec(),
+                expected_sha256: None,
+            }],
+            &[StateWrite {
+                path: state.clone(),
+                contents: b"enabled".to_vec(),
+            }],
+            &root.path().join("transactions"),
+        )
+        .unwrap();
+        atomic_write(
+            &root.path().join("image-pending.json"),
+            &serde_json::to_vec(&receipt.journal).unwrap(),
+        )
+        .unwrap();
+        (root, target, state, receipt)
+    }
+
+    #[test]
+    fn verified_committed_marker_is_cleared_and_disable_can_proceed() {
+        let (root, target, state, _) = pending_fixture();
+        let directory = root.path().join("transactions");
+        let images = [ImageWrite {
+            target: target.clone(),
+            image: b"image-old".to_vec(),
+            expected_sha256: Some(sha256::digest(b"image-new")),
+        }];
+        assert!(install("disable-kpm", &images, &directory).is_err());
+        reconcile_pending(&root.path().join("image-pending.json"), |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"image-new");
+        assert_eq!(fs::read(&state).unwrap(), b"enabled");
+        install_with_state(
+            "disable-kpm",
+            &images,
+            &[StateWrite {
+                path: state.clone(),
+                contents: b"disabled".to_vec(),
+            }],
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"image-old");
+        assert_eq!(fs::read(state).unwrap(), b"disabled");
+    }
+
+    #[test]
+    fn interrupted_image_and_state_publication_is_reconciled_together() {
+        for phase in [
+            "writing:0",
+            "publishing:0",
+            "restoring",
+            "recovery_required",
+        ] {
+            let (root, target, state, receipt) = pending_fixture();
+            let mut journal: Journal =
+                serde_json::from_slice(&fs::read(&receipt.journal).unwrap()).unwrap();
+            journal.state = phase.into();
+            fs::write(&state, b"disabled").unwrap();
+            save_journal(&receipt.journal, &journal).unwrap();
+            reconcile_pending(&root.path().join("image-pending.json"), |_, _| Ok(())).unwrap();
+            assert_eq!(fs::read(target).unwrap(), b"image-old");
+            assert_eq!(fs::read(state).unwrap(), b"disabled");
+            assert!(!root.path().join("image-pending.json").exists());
+            let journal: Journal =
+                serde_json::from_slice(&fs::read(receipt.journal).unwrap()).unwrap();
+            assert_eq!(journal.state, "rolled_back");
+        }
+    }
+
+    #[test]
+    fn durable_publication_finishes_commit_without_restoring_the_old_image() {
+        let (root, target, state, receipt) = pending_fixture();
+        let mut journal: Journal =
+            serde_json::from_slice(&fs::read(&receipt.journal).unwrap()).unwrap();
+        journal.state = "publishing:0".into();
+        save_journal(&receipt.journal, &journal).unwrap();
+        reconcile_pending(&root.path().join("image-pending.json"), |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"image-new");
+        assert_eq!(fs::read(state).unwrap(), b"enabled");
+        let journal: Journal = serde_json::from_slice(&fs::read(receipt.journal).unwrap()).unwrap();
+        assert_eq!(journal.state, "committed");
+        assert!(!root.path().join("image-pending.json").exists());
+    }
+
+    #[test]
+    fn restored_transaction_only_clears_its_own_marker() {
+        let (root, target, state, receipt) = pending_fixture();
+        let mut journal: Journal =
+            serde_json::from_slice(&fs::read(&receipt.journal).unwrap()).unwrap();
+        journal.state = "rolled_back".into();
+        fs::write(&target, b"image-old").unwrap();
+        fs::write(&state, b"disabled").unwrap();
+        save_journal(&receipt.journal, &journal).unwrap();
+        reconcile_pending(&root.path().join("image-pending.json"), |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"image-old");
+        assert_eq!(fs::read(state).unwrap(), b"disabled");
+        assert!(!root.path().join("image-pending.json").exists());
+    }
+
+    #[test]
+    fn uncertain_pending_recovery_preserves_images_states_and_ownership() {
+        for mutation in 0..8 {
+            let (root, target, state, receipt) = pending_fixture();
+            let mut journal: Journal =
+                serde_json::from_slice(&fs::read(&receipt.journal).unwrap()).unwrap();
+            journal.state = "writing:0".into();
+            match mutation {
+                0 => fs::write(&target, b"image-OTA").unwrap(),
+                1 => fs::write(&state, b"newer-state").unwrap(),
+                2 => fs::write(&journal.entries[0].backup, b"bad-image").unwrap(),
+                3 => fs::write(&journal.entries[0].staged, b"bad-image").unwrap(),
+                4 => journal.attempted = 0,
+                5 => journal.attempted = 2,
+                6 => journal.state = "unknown".into(),
+                _ => journal.state = "committed".into(),
+            }
+            if mutation == 7 {
+                fs::write(&state, b"disabled").unwrap();
+            }
+            save_journal(&receipt.journal, &journal).unwrap();
+            let image_before = fs::read(&target).unwrap();
+            let state_before = fs::read(&state).unwrap();
+            let pending = root.path().join("image-pending.json");
+            let pending_before = fs::read(&pending).unwrap();
+            assert!(reconcile_pending(&pending, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(target).unwrap(), image_before);
+            assert_eq!(fs::read(state).unwrap(), state_before);
+            assert_eq!(fs::read(pending).unwrap(), pending_before);
+        }
+    }
+
+    #[test]
+    fn recovery_checks_device_constraints_before_any_mutation() {
+        let (root, target, state, _) = pending_fixture();
+        let pending = root.path().join("image-pending.json");
+        assert!(
+            reconcile_pending(&pending, |_, _| bail!("recovery device does not match")).is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"image-new");
+        assert_eq!(fs::read(state).unwrap(), b"enabled");
+        assert!(pending.exists());
+    }
+
+    #[test]
+    fn symlink_recovery_marker_is_rejected() {
+        let (root, target, state, _) = pending_fixture();
+        let pending = root.path().join("image-pending.json");
+        let saved = root.path().join("saved-marker");
+        fs::rename(&pending, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &pending).unwrap();
+        assert!(reconcile_pending(&pending, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"image-new");
+        assert_eq!(fs::read(state).unwrap(), b"enabled");
+        assert!(
+            fs::symlink_metadata(pending)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

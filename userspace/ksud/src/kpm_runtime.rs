@@ -9,6 +9,7 @@ use super::failure;
 
 const HELLO: u32 = 0x1000;
 const VERSION: u32 = 0x1008;
+const LOAD_PATH: u32 = 0x1020;
 const LOAD_BUFFER: u32 = 0x1023;
 const UNLOAD: u32 = 0x1021;
 const CONTROL: u32 = 0x1022;
@@ -27,26 +28,29 @@ pub(super) struct Probe {
     pub version: Option<String>,
     pub capabilities: Option<u64>,
     pub error: Option<String>,
+    pub upstream: bool,
 }
 
 impl Probe {
     pub const fn can_unload(&self) -> bool {
         self.managed()
-            && matches!(self.capabilities, Some(capabilities) if capabilities & UNLOAD_CAPABILITY != 0)
+            && (self.upstream
+                || matches!(self.capabilities, Some(capabilities) if capabilities & UNLOAD_CAPABILITY != 0))
     }
 
     pub const fn avc_conflict(&self) -> bool {
-        self.error.is_some() || (self.active && !self.managed())
+        self.error.is_some() || (self.active && (self.upstream || !self.managed()))
     }
 
     pub const fn managed(&self) -> bool {
         self.active
             && self.error.is_none()
-            && matches!(
-                self.capabilities,
-                Some(capabilities)
-                    if capabilities & REQUIRED_CAPABILITIES == REQUIRED_CAPABILITIES
-            )
+            && (self.upstream
+                || matches!(
+                    self.capabilities,
+                    Some(capabilities)
+                        if capabilities & REQUIRED_CAPABILITIES == REQUIRED_CAPABILITIES
+                ))
     }
 }
 
@@ -77,6 +81,14 @@ fn command_word(command: u32) -> u64 {
     (0x0000_0d05_u64 << 32) | (0x2026_u64 << 16) | u64::from(command)
 }
 
+fn compatible_command(command: u32, version: i64) -> u64 {
+    if version >= 0x0a05 {
+        command_word(command)
+    } else {
+        u64::from(command)
+    }
+}
+
 fn syscall(command: u32, args: [usize; 4]) -> Result<i64> {
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
     {
@@ -85,11 +97,13 @@ fn syscall(command: u32, args: [usize; 4]) -> Result<i64> {
             unsafe { libc::getuid() } == 0,
             failure("root_required", "KPM operations require UID 0")
         );
+        // Match KPatch-Next's compact_cmd(), including older unversioned engines.
+        let version = unsafe { libc::syscall(45 as libc::c_long, 0_usize, command_word(VERSION)) };
         let result = unsafe {
             libc::syscall(
                 45 as libc::c_long,
                 0_usize,
-                command_word(command),
+                compatible_command(command, version),
                 args[0],
                 args[1],
                 args[2],
@@ -98,20 +112,25 @@ fn syscall(command: u32, args: [usize; 4]) -> Result<i64> {
         };
         if result < 0 {
             let error = io::Error::last_os_error();
-            return Err(failure(
-                if error.raw_os_error() == Some(libc::EINPROGRESS) {
+            let pending = error.raw_os_error() == Some(libc::EINPROGRESS);
+            return Err(anyhow::Error::new(error).context(super::KpmFailure {
+                code: if pending {
                     "reboot_required"
                 } else {
                     "kernel_error"
                 },
-                format!("KPatch command {command:#x}: {error}"),
-            ));
+                message: format!("KPatch command {command:#x}"),
+            }));
         }
         Ok(result)
     }
     #[cfg(not(all(target_os = "android", target_arch = "aarch64")))]
     {
-        let _ = (command_word(command), args, io::Error::last_os_error());
+        let _ = (
+            compatible_command(command, 0x0d05),
+            args,
+            io::Error::last_os_error(),
+        );
         Err(failure(
             "unsupported",
             "KPM requires an Android ARM64 kernel",
@@ -147,7 +166,12 @@ fn output_string(buffer: &[u8]) -> Result<String> {
 }
 
 fn parse_info(text: &str) -> Result<RuntimeModule> {
-    let mut module = RuntimeModule::default();
+    // Standard KPatch-Next info has no lifecycle or control-capability fields.
+    let mut module = RuntimeModule {
+        state: "loaded".into(),
+        has_control: true,
+        ..RuntimeModule::default()
+    };
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -222,7 +246,16 @@ pub(super) fn probe_with(mut call: impl FnMut(u32) -> Result<i64>) -> Probe {
     match call(CAPABILITIES).and_then(|value| u64::try_from(value).map_err(Into::into)) {
         Ok(capabilities) => probe.capabilities = Some(capabilities),
         Err(error) => {
-            probe.error = Some(format!("KPM capability probe failed: {error:#}"));
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSYS))
+            }) {
+                // 0x1033 is a MilkSU extension, absent from standard KPatch-Next.
+                probe.upstream = true;
+            } else {
+                probe.error = Some(format!("KPM capability probe failed: {error:#}"));
+            }
         }
     }
     probe
@@ -264,6 +297,22 @@ impl Engine for NativeEngine {
             )
         );
         let args = checked_string(args, ARGS_LIMIT)?;
+        if self.probe().upstream {
+            use std::io::Write;
+            use std::os::unix::ffi::OsStrExt;
+
+            // Match sc_kpm_load(path, args, NULL). Keep the validated bytes
+            // private and the file alive until the synchronous syscall returns.
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(image)?;
+            file.as_file().sync_all()?;
+            let path = CString::new(file.path().as_os_str().as_bytes())?;
+            syscall(
+                LOAD_PATH,
+                [path.as_ptr() as usize, load_arguments_pointer(&args), 0, 0],
+            )?;
+            return Ok(());
+        }
         syscall(
             LOAD_BUFFER,
             [
@@ -296,5 +345,38 @@ impl Engine for NativeEngine {
         let name = checked_string(name, 31)?;
         syscall(UNLOAD, [name.as_ptr() as usize, 0, 0, 0])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_info_is_a_loaded_controllable_module() {
+        let module = parse_info("name=standard\nversion=1\nauthor=author\nargs=x=y\n").unwrap();
+        assert_eq!(module.state, "loaded");
+        assert!(module.has_control);
+        assert_eq!(module.args, "x=y");
+        assert!(!module.pending_unload);
+        let module =
+            parse_info("name=extended\nstate=failed\nhas_control=0\npending_unload=1\n").unwrap();
+        assert_eq!(module.state, "failed");
+        assert!(!module.has_control);
+        assert!(module.pending_unload);
+    }
+
+    #[test]
+    fn command_encoding_matches_upstream_compact_cmd() {
+        assert_eq!(compatible_command(LOAD_PATH, 0x0a04), 0x1020);
+        assert_eq!(compatible_command(HELLO, -i64::from(libc::ENOSYS)), 0x1000);
+        assert_eq!(
+            compatible_command(LOAD_PATH, 0x0a05),
+            command_word(LOAD_PATH)
+        );
+        assert_eq!(
+            compatible_command(LOAD_BUFFER, 0x0d05),
+            command_word(LOAD_BUFFER)
+        );
     }
 }

@@ -175,6 +175,14 @@ pub fn get_version() -> i32 {
     get_info().version as i32
 }
 
+pub fn refresh_manager_identity() -> Result<()> {
+    let mut cmd = ksu_uapi::ksu_get_manager_appid_cmd {
+        appid: ksu_uapi::KSU_MANAGER_REFRESH_REQUEST,
+    };
+    ksuctl(ksu_uapi::KSU_IOCTL_GET_MANAGER_APPID, &raw mut cmd)?;
+    Ok(())
+}
+
 pub fn is_late_load() -> bool {
     get_info().flags & ksu_uapi::KSU_GET_INFO_FLAG_LATE_LOAD != 0
 }

@@ -11,16 +11,17 @@ static inline void ksu_throne_tracker_exit()
 {
 }
 
-static inline void track_throne(bool prune_only)
+static inline int track_throne(bool prune_only)
 {
     (void)prune_only;
+    return 0;
 }
 #else
 void ksu_throne_tracker_init();
 
 void ksu_throne_tracker_exit();
 
-void track_throne(bool prune_only);
+int track_throne(bool prune_only);
 #endif
 
 #endif

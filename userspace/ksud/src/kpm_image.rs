@@ -11,13 +11,30 @@ use std::process::Command;
 
 use crate::image_transaction;
 
+// KPM patches the kernel in boot, never the ramdisk in init_boot/vendor_boot.
+#[cfg(target_os = "android")]
+fn kernel_partition_path() -> Result<PathBuf> {
+    let slot = crate::boot_patch::get_slot_suffix(false);
+    ensure!(
+        matches!(slot.as_str(), "" | "_a" | "_b"),
+        "invalid slot suffix"
+    );
+    for directory in ["/dev/block/by-name", "/dev/block/bootdevice/by-name"] {
+        let candidate = Path::new(directory).join(format!("boot{slot}"));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("Cannot locate the active boot{slot} partition")
+}
+
 #[derive(clap::Subcommand, Debug)]
 pub enum ImageCommand {
     /// Report the image header, kernel and ramdisk hashes
     Inspect { boot: PathBuf },
     /// Save the original, compressed kernel without modifying its container
     ExportKernel { boot: PathBuf, out: PathBuf },
-    /// Reconstruct a baseline only when repatching exactly matches the input
+    /// Recover the embedded baseline and verify that the bundled engine can patch it
     RecoverKernel {
         #[arg(long)]
         boot: PathBuf,
@@ -61,9 +78,9 @@ fn parse_boot(bytes: &[u8]) -> Result<BootImage<'_>> {
     ensure!(
         matches!(
             boot.get_header().get_version(),
-            BootImageVersion::Android(3 | 4)
+            BootImageVersion::Android(0..=4)
         ),
-        "only boot headers v3/v4 are supported"
+        "unsupported Android boot header version"
     );
     ensure!(
         boot.get_blocks().get_kernel().is_some(),
@@ -261,9 +278,12 @@ fn verify_recovered_kernel(
 ) -> Result<Vec<u8>> {
     validate_baseline(&recovered)?;
     ensure!(
-        repatch(&recovered)? == kernel,
-        "boot kernel does not match the bundled MilkSU engine; refusing to adopt it"
+        recovered.len() <= kernel.len() && recovered[8..] == kernel[8..recovered.len()],
+        "KPatch recovery changed the original kernel body"
     );
+    // KPatch-Next -u restores the saved entry and removes the old payload.
+    // A different engine version or build timestamp must not prevent -p upgrades.
+    repatch(&recovered)?;
     Ok(recovered)
 }
 
@@ -640,7 +660,7 @@ fn apply_runtime_configuration_status(
 ) {
     let enabled = state.is_some_and(|state| state.enabled);
     let can_enable = arm64 && bundled_engine.is_ok() && (state.is_some() || !active);
-    let can_disable = state.is_some();
+    let can_disable = arm64 && state.is_some();
     let configuration_error = bundled_engine
         .as_ref()
         .err()
@@ -764,8 +784,8 @@ pub fn transition_status(active: bool) -> Result<Value> {
         }
     };
     let mut recovery_error = None;
-    if state.is_none() && active {
-        let recovery = (|| -> Result<IntegrationState> {
+    if state.is_none() {
+        let recovery = (|| -> Result<Option<IntegrationState>> {
             let directory = Path::new(INTEGRATION_DIR);
             image_transaction::secure_dir(directory)?;
             let lock = std::fs::OpenOptions::new()
@@ -775,10 +795,10 @@ pub fn transition_status(active: bool) -> Result<Value> {
                 .truncate(false)
                 .open(directory.join("operation.lock"))?;
             image_transaction::try_lock_file(&lock)?;
-            read_state()?.map_or_else(recover_running_integration, Ok)
+            read_state()?.map_or_else(|| recover_boot_integration(active), |state| Ok(Some(state)))
         })();
         match recovery {
-            Ok(recovered) => state = Some(recovered),
+            Ok(recovered) => state = recovered,
             Err(error) => recovery_error = Some(error),
         }
     }
@@ -790,8 +810,7 @@ pub fn transition_status(active: bool) -> Result<Value> {
             .context("KPM disable requires a verified MilkSU restoration record")?;
         let slot = crate::boot_patch::get_slot_suffix(false);
         let kmi = crate::boot_patch::get_current_kmi()?;
-        let source =
-            image_transaction::read_image(Path::new(&format!("/dev/block/by-name/boot{slot}")))?;
+        let source = image_transaction::read_image(&kernel_partition_path()?)?;
         verified_original(state, &source, Path::new(INTEGRATION_DIR), &slot, &kmi)?;
         Ok(())
     })();
@@ -865,8 +884,7 @@ fn configuration_engine(state: Option<&IntegrationState>, active: bool) -> Resul
     let digest = sha256::digest(crate::assets::get_asset_data("kpimg")?.as_ref());
     let slot = crate::boot_patch::get_slot_suffix(false);
     let kmi = crate::boot_patch::get_current_kmi()?;
-    let source =
-        image_transaction::read_image(Path::new(&format!("/dev/block/by-name/boot{slot}")))?;
+    let source = image_transaction::read_image(&kernel_partition_path()?)?;
     let baseline = if let Some(state) = state {
         let original = verified_original(state, &source, Path::new(INTEGRATION_DIR), &slot, &kmi)?;
         decoded_kernel(&replace_kernel(&source, original, true)?)?
@@ -921,11 +939,10 @@ fn embedded_tool(name: &str, executable: bool) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
-fn recover_running_integration() -> Result<IntegrationState> {
+fn recover_boot_integration(active: bool) -> Result<Option<IntegrationState>> {
     let _image_lock = image_transaction::operation_lock(Path::new(INTEGRATION_DIR))?;
     let slot = crate::boot_patch::get_slot_suffix(false);
-    let source =
-        image_transaction::read_image(Path::new(&format!("/dev/block/by-name/boot{slot}")))?;
+    let source = image_transaction::read_image(&kernel_partition_path()?)?;
     let kernel = raw_kernel(&source)?;
     let decoded = decoded_kernel(&source)?;
     let tool = embedded_tool("kptools", true)?;
@@ -939,12 +956,16 @@ fn recover_running_integration() -> Result<IntegrationState> {
             input.path().as_os_str(),
         ],
     )?;
+    if info.lines().any(|line| line.trim() == "patched=false") && !active {
+        return Ok(None);
+    }
     ensure!(
         info.lines().any(|line| line.trim() == "patched=true"),
-        "active KPM engine has no verifiable bundled patch in the boot image"
+        "active KPM engine has no recoverable KPatch image in the boot partition"
     );
     let kpimg = embedded_tool("kpimg", false)?;
     let recovered = recover_kernel_bytes(&decoded, &tool, &kpimg)?;
+    let current_engine = patch_kernel_bytes(&recovered, &tool, &kpimg)? == decoded;
     let original = raw_kernel(&replace_kernel(&source, recovered, false)?)?;
     let original_sha256 = sha256::digest(&original);
     let original_kernel =
@@ -961,11 +982,15 @@ fn recover_running_integration() -> Result<IntegrationState> {
         boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned(),
-        engine_sha256: sha256::digest(crate::assets::get_asset_data("kpimg")?.as_ref()),
-        reboot_pending: false,
+        engine_sha256: if current_engine {
+            sha256::digest(crate::assets::get_asset_data("kpimg")?.as_ref())
+        } else {
+            String::new()
+        },
+        reboot_pending: !active,
     };
     image_transaction::atomic_write(&state_path()?, &serde_json::to_vec_pretty(&state)?)?;
-    Ok(state)
+    Ok(Some(state))
 }
 
 #[cfg(target_os = "android")]
@@ -977,8 +1002,9 @@ pub fn set_enabled(enabled: bool) -> Result<Value> {
     );
     ensure!(
         cfg!(target_arch = "aarch64"),
-        "KPM integration requires ARM64"
+        "KPM engine installation requires an ARM64 kernel image"
     );
+    image_transaction::recover_pending()?;
     crate::storage::prepare_kpm()?;
     let directory = Path::new(INTEGRATION_DIR);
     image_transaction::secure_dir(directory)?;
@@ -995,14 +1021,14 @@ pub fn set_enabled(enabled: bool) -> Result<Value> {
         "invalid slot suffix"
     );
     let kmi = crate::boot_patch::get_current_kmi()?;
-    let target = PathBuf::from(format!("/dev/block/by-name/boot{slot}"));
+    let target = kernel_partition_path()?;
     let source = image_transaction::read_image(&target)?;
     let kernel = raw_kernel(&source)?;
     let current_sha256 = sha256::digest(&kernel);
     let active = crate::kpm::engine_active();
     let runtime_ready = crate::kpm::engine_managed();
     let old_state = match read_state()? {
-        None if active => Some(recover_running_integration()?),
+        None => recover_boot_integration(active)?,
         state => state,
     };
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
@@ -1144,6 +1170,40 @@ mod tests {
         image[20..24].copy_from_slice(&1584_u32.to_le_bytes());
         image[40..44].copy_from_slice(&4_u32.to_le_bytes());
         assert!(parse_boot(&image).is_err());
+    }
+
+    #[test]
+    fn legacy_boot_headers_preserve_kernel_and_ramdisk_on_round_trip() {
+        for version in 0_u32..=2 {
+            let mut image = vec![0; 12_288];
+            image[..8].copy_from_slice(b"ANDROID!");
+            image[8..12].copy_from_slice(&64_u32.to_le_bytes());
+            image[16..20].copy_from_slice(&16_u32.to_le_bytes());
+            image[36..40].copy_from_slice(&4096_u32.to_le_bytes());
+            image[40..44].copy_from_slice(&version.to_le_bytes());
+            let header_size = if version == 1 { 1648_u32 } else { 1660_u32 };
+            if version > 0 {
+                image[1644..1648].copy_from_slice(&header_size.to_le_bytes());
+            }
+            image[4096 + 0x38..4096 + 0x3c].copy_from_slice(b"ARM\x64");
+            image[8192..8208].copy_from_slice(b"ramdisk-preserve");
+            let original = raw_kernel(&image).unwrap();
+            let mut replacement = original.clone();
+            replacement[0] = 0x55;
+            let patched = replace_kernel(&image, replacement.clone(), true).unwrap();
+            assert_eq!(raw_kernel(&patched).unwrap(), replacement);
+            let restored = replace_kernel(&patched, original.clone(), true).unwrap();
+            assert_eq!(raw_kernel(&restored).unwrap(), original);
+            assert_eq!(
+                parse_boot(&restored)
+                    .unwrap()
+                    .get_blocks()
+                    .get_ramdisk()
+                    .unwrap()
+                    .get_data(),
+                b"ramdisk-preserve"
+            );
+        }
     }
 
     #[test]
@@ -1608,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_exact_current_bundle_round_trip() {
+    fn recovery_accepts_upstream_or_older_engine_and_verifies_kernel_body() {
         let original = raw_kernel(&test_boot()).unwrap();
         let mut old_patched = original.clone();
         old_patched[0] = 0x11;
@@ -1618,12 +1678,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(exact, original);
+        let upgraded = verify_recovered_kernel(&old_patched, original.clone(), |baseline| {
+            let mut current = baseline.to_vec();
+            current[0] = 0x22;
+            Ok(current)
+        })
+        .unwrap();
+        assert_eq!(upgraded, original);
+        let mut different_kernel = original.clone();
+        different_kernel[24] ^= 1;
         assert!(
-            verify_recovered_kernel(&old_patched, original.clone(), |baseline| {
-                let mut current = baseline.to_vec();
-                current[0] = 0x22;
-                Ok(current)
-            },)
+            verify_recovered_kernel(&old_patched, different_kernel, |_| {
+                panic!("must reject before patching a different kernel");
+            })
             .is_err()
         );
         assert!(

@@ -11,7 +11,7 @@ case "$stage" in
     ksuinit|ksud|manager|manager-tests|manager-lint|manager-assemble|repack) milksu_heavy_lock ;;
 esac
 work="${MILKSU_RELEASE_SOURCE:-$MILKSU_CACHE/build/release/source}"
-abis="${MILKSU_ABIS:-arm64-v8a}"
+abis="${MILKSU_ABIS:-arm64-v8a x86_64}"
 mkdir -p "$MILKSU_CACHE/build"
 lock_name="$(printf '%s' "$work" | sha256sum | cut -c1-16)"
 exec {release_lock}>"$MILKSU_CACHE/build/release-$lock_name.lock"
@@ -83,15 +83,17 @@ case "$stage" in
                     [[ -f "$module" ]] || continue
                     cp "$module" "$work/userspace/ksud/bin/$arch/"
                 done
-                [[ -s "$work/userspace/ksud/bin/$arch/android14-6.1_kernelsu.ko" ]] ||
-                    milksu_die "The priority android14-6.1 root LKM is missing."
-                [[ -s "$work/userspace/ksud/bin/$arch/android14-6.1_susfs_guard_lkm.ko" ]] ||
-                    milksu_die "The priority android14-6.1 SUSFS LKM is missing."
-                if [[ "${MILKSU_REQUIRE_FULL_MATRIX:-1}" == 1 ]]; then
-                    milksu_run python3 "$MILKSU_ROOT/tools/build-verify-modules.py"
-                else
-                    milksu_run python3 "$MILKSU_ROOT/tools/build-verify-modules.py" \
-                        --kmi android14-6.1 --kmi android12-5.10
+                if [[ "$abi" == arm64-v8a ]]; then
+                    [[ -s "$work/userspace/ksud/bin/$arch/android14-6.1_kernelsu.ko" ]] ||
+                        milksu_die "The priority android14-6.1 root LKM is missing."
+                    [[ -s "$work/userspace/ksud/bin/$arch/android14-6.1_susfs_guard_lkm.ko" ]] ||
+                        milksu_die "The priority android14-6.1 SUSFS LKM is missing."
+                    if [[ "${MILKSU_REQUIRE_FULL_MATRIX:-1}" == 1 ]]; then
+                        milksu_run python3 "$MILKSU_ROOT/tools/build-verify-modules.py"
+                    else
+                        milksu_run python3 "$MILKSU_ROOT/tools/build-verify-modules.py" \
+                            --kmi android14-6.1 --kmi android12-5.10
+                    fi
                 fi
                 python3 - "$work/userspace/ksud/bin/$arch" "$MILKSU_OUT/manifests/embedded-assets-$arch.json" <<'PY'
 import hashlib, json, pathlib, sys
@@ -135,7 +137,8 @@ PY
             -Pkotlin.compiler.execution.strategy=in-process
             -Pandroid.injected.testOnly=false
             --init-script "$signing_init"
-            "-PKSU_PACKAGE_NAME=$MILKSU_PACKAGE_NAME" -PKSU_NAME=MilkSU
+            "-PKSU_PACKAGE_NAME=$MILKSU_PACKAGE_NAME" -PKSU_NAME=xiaoyuSU
+            "-PMILKSU_ABIS=$abis"
         )
         case "$stage" in
             manager-tests) manager_tasks=(:app:testReleaseUnitTest) ;;
@@ -178,11 +181,11 @@ version_file, directory = map(pathlib.Path, sys.argv[1:3])
 version = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
 name = version["MILKSU_VERSION_NAME"]
 code = version.get("MILKSU_MANAGER_VERSION_CODE", version["MILKSU_VERSION_CODE"])
-target = directory / f"MilkSU_{name}_{code}.apk"
+target = directory / f"xiaoyuSU_{name}_{code}.apk"
 shutil.copy2(directory / sys.argv[3], target)
 print(f"Stable release APK: {target}")
 PY
         ;;
-    *) milksu_die "Usage: $0 {snapshot --source-ready|snapshot --preview|manager-sync|ksuinit|ksud|manager|manager-tests|manager-lint|manager-assemble|repack}. Default ABI: arm64-v8a." ;;
+    *) milksu_die "Usage: $0 {snapshot --source-ready|snapshot --preview|manager-sync|ksuinit|ksud|manager|manager-tests|manager-lint|manager-assemble|repack}. Default ABIs: arm64-v8a x86_64." ;;
 esac
 milksu_space

@@ -15,6 +15,9 @@ def main() -> None:
     apk = Path(sys.argv[1]).resolve()
     out = Path(os.environ.get("MILKSU_OUT", Path(__file__).resolve().parents[1] / "out"))
     certificate = json.loads((out / "private/certificate.json").read_text())
+    if re.fullmatch(r"(me\.weishu\.kernelsu|com\.rifsxd\.ksunext)(\..*)?",
+                    certificate["KSU_PACKAGE_NAME"]):
+        raise SystemExit("MilkSU must use its own application ID; upstream Manager identities are reserved")
     if os.environ.get("MILKSU_REQUIRE_RELEASE_SIGNING") == "1" and (
             certificate.get("signing_profile") != "release" or
             certificate.get("development_only") is not False):
@@ -70,11 +73,36 @@ def main() -> None:
         raise SystemExit("Final APK must install normally; testOnly is still enabled")
     if re.search(r"android:debuggable" + true_attribute, manifest_xml):
         raise SystemExit("Final APK must not be debuggable")
-    expected = out / "ksud/arm64-v8a/ksud"
+    abi_machines = {"arm64-v8a": 183, "x86_64": 62}
+    requested_abis = os.environ.get("MILKSU_ABIS")
+    native_daemons = {}
     with zipfile.ZipFile(apk) as archive:
+        packaged_abis = {
+            name.split("/")[1] for name in archive.namelist()
+            if name.startswith("lib/") and name.endswith("/libksud.so")
+        }
+        if requested_abis:
+            requested = set(re.split(r"[,\s]+", requested_abis.strip()))
+            if packaged_abis != requested:
+                raise SystemExit("APK daemon ABIs differ from the requested build ABIs")
+        for abi in sorted(packaged_abis):
+            if abi not in abi_machines:
+                raise SystemExit(f"Unsupported packaged daemon ABI: {abi}")
+            packaged = archive.read(f"lib/{abi}/libksud.so")
+            expected = out / f"ksud/{abi}/ksud"
+            if not expected.is_file() or packaged != expected.read_bytes():
+                raise SystemExit(f"APK libksud.so differs from the source-built release daemon: {abi}")
+            if packaged[:4] != b"\x7fELF" or int.from_bytes(packaged[18:20], "little") != abi_machines[abi]:
+                raise SystemExit(f"Embedded ksud has the wrong ELF machine for {abi}")
+            for library in ("libkernelsu.so", "libadbroot.so"):
+                name = f"lib/{abi}/{library}"
+                if name not in archive.namelist():
+                    raise SystemExit(f"APK is missing a native library: {name}")
+                data = archive.read(name)
+                if data[:4] != b"\x7fELF" or int.from_bytes(data[18:20], "little") != abi_machines[abi]:
+                    raise SystemExit(f"APK native library has the wrong ELF machine: {name}")
+            native_daemons[abi] = hashlib.sha256(packaged).hexdigest()
         daemon = archive.read("lib/arm64-v8a/libksud.so")
-        if hashlib.sha256(daemon).digest() != hashlib.sha256(expected.read_bytes()).digest():
-            raise SystemExit("APK libksud.so differs from the source-built release daemon")
         if daemon[:4] != b"\x7fELF" or int.from_bytes(daemon[18:20], "little") != 183:
             raise SystemExit("Embedded ksud is not an AArch64 ELF")
     manifest = {
@@ -86,6 +114,7 @@ def main() -> None:
         "version_code": version_code,
         "certificate_sha256": match.group(1).lower(),
         "ksud_sha256": hashlib.sha256(daemon).hexdigest(),
+        "native_daemons": native_daemons,
     }
     if certificate.get("signing_profile") == "release":
         manifest.update(signing_profile="release", development_only=False)

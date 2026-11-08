@@ -53,7 +53,7 @@ def main():
         )
         time.sleep(0.4)
         if args.phase == "startup":
-            adb("shell", "am", "start", "-n", package + "/me.weishu.kernelsu.ui.MainActivity")
+            adb("shell", "am", "start", "-n", package + "/io.milksu.manager.ui.MainActivity")
         else:
             target = 0.3 if args.phase == "kpm" else 0.9
             adb("shell", "input", "tap", str(int(width * target)), str(int(height * 0.95)))

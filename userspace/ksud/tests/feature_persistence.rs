@@ -6,6 +6,8 @@ use std::sync::{LazyLock, Mutex};
 
 #[path = "../src/feature.rs"]
 mod feature;
+#[path = "../src/feature_config.rs"]
+mod feature_config;
 #[path = "../src/feature_id.rs"]
 mod feature_id;
 
@@ -66,9 +68,9 @@ mod ksucalls {
 
 #[test]
 fn saving_one_feature_preserves_temporary_su_override_and_failed_writes() {
-    let initial = HashMap::from([(0, 1), (2, 0), (10003, 0)]);
+    let initial = HashMap::from([(0, 1), (1, 1), (2, 0), (10003, 0)]);
     feature::save_binary_config(&initial).unwrap();
-    for (id, value) in [(0, 0), (2, 1), (10003, 1)] {
+    for (id, value) in [(0, 0), (1, 1), (2, 1), (10003, 1)] {
         KERNEL.lock().unwrap().insert(
             id,
             ksucalls::FeatureState {
@@ -80,11 +82,20 @@ fn saving_one_feature_preserves_temporary_su_override_and_failed_writes() {
     }
     feature::save_config(Some("avc_spoof")).unwrap();
     let saved = feature::load_binary_config().unwrap();
-    assert_eq!(saved, HashMap::from([(0, 1), (2, 0), (10003, 1)]));
+    assert_eq!(saved, HashMap::from([(0, 1), (1, 1), (2, 0), (10003, 1)]));
     feature::save_config(Some("sulog")).unwrap();
     feature::load_config_and_apply().unwrap();
     assert_eq!(ksucalls::get_feature(0).unwrap().value, 1);
     assert_eq!(ksucalls::get_feature(2).unwrap().value, 1);
+    assert_eq!(ksucalls::get_feature(10003).unwrap().value, 1);
+
+    feature::set_persistent_feature("kernel_umount", 0).unwrap();
+    assert_eq!(feature::load_binary_config().unwrap()[&1], 0);
+    // Model a new kernel boot with its default enabled value.
+    ksucalls::set_feature(1, 1).unwrap();
+    feature::init_features().unwrap();
+    assert_eq!(ksucalls::get_feature(1).unwrap().value, 0);
+    assert_eq!(ksucalls::get_feature(0).unwrap().value, 1);
     assert_eq!(ksucalls::get_feature(10003).unwrap().value, 1);
 
     let path = std::path::Path::new(defs::WORKING_DIR).join(".feature_config");
@@ -96,6 +107,17 @@ fn saving_one_feature_preserves_temporary_su_override_and_failed_writes() {
     assert_eq!(std::fs::read(&path).unwrap(), previous);
 
     std::fs::write(&path, b"truncated config").unwrap();
-    assert!(feature::save_config(Some("sulog")).is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), b"truncated config");
+    feature::save_config(Some("sulog")).unwrap();
+    assert_eq!(
+        feature::load_binary_config().unwrap(),
+        HashMap::from([(2, 1)])
+    );
+
+    // Publishing failure must restore the runtime value instead of showing
+    // a successful disable which disappears on reboot.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(feature::set_persistent_feature("kernel_umount", 1).is_err());
+    assert_eq!(ksucalls::get_feature(1).unwrap().value, 0);
+    std::fs::remove_dir(&path).unwrap();
 }

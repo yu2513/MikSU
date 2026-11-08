@@ -2,6 +2,7 @@
 
 import com.google.protobuf.gradle.id
 import com.android.build.api.variant.HostTestBuilder
+import java.io.File
 import java.net.URI
 
 plugins {
@@ -29,6 +30,9 @@ val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: 
 val defaultManagerPackageName = if (isPrBuild) "io.milksu.manager.pr" else "io.milksu.manager"
 val defaultManagerName = if (isPrBuild) "MilkSU PR" else "MilkSU"
 val managerPackageName = project.findProperty("KSU_PACKAGE_NAME")?.toString() ?: defaultManagerPackageName
+require(!Regex("^(me\\.weishu\\.kernelsu|com\\.rifsxd\\.ksunext)(\\..*)?$").matches(managerPackageName)) {
+    "MilkSU must use its own application ID; upstream Manager identities are reserved."
+}
 val managerName = project.findProperty("KSU_NAME")?.toString() ?: defaultManagerName
 val milkSuUpdateUrl = providers.gradleProperty("MILKSU_UPDATE_URL")
     .orElse(providers.environmentVariable("MILKSU_UPDATE_URL"))
@@ -44,6 +48,24 @@ apksign {
     storePasswordProperty = "KEYSTORE_PASSWORD"
     keyAliasProperty = "KEY_ALIAS"
     keyPasswordProperty = "KEY_PASSWORD"
+}
+
+fun managerAbis(): List<String> {
+    val known = listOf("arm64-v8a", "x86_64")
+    val jniLibs = layout.projectDirectory.dir("src/main/jniLibs").asFile
+    val staged = known.filter { File(jniLibs, "$it/libksud.so").isFile }
+    val configured = providers.gradleProperty("MILKSU_ABIS")
+        .orElse(providers.environmentVariable("MILKSU_ABIS"))
+        .orNull
+    val requested = configured?.split(Regex("[,\\s]+"))?.filter(String::isNotBlank)?.distinct()
+        ?: staged.ifEmpty { known }
+    require(requested.isNotEmpty() && requested.all { it in known }) {
+        "MILKSU_ABIS must contain supported daemon ABIs: ${known.joinToString()}"
+    }
+    require(requested.all { it in staged }) {
+        "Build and stage libksud.so for each requested ABI before Manager: ${requested.filterNot { it in staged }}"
+    }
+    return requested
 }
 
 protobuf {
@@ -72,7 +94,7 @@ val baseCFlags = listOf(
 val baseCppFlags = baseCFlags + "-fno-rtti"
 
 android {
-    namespace = "me.weishu.kernelsu"
+    namespace = "io.milksu.manager"
 
     buildTypes {
         debug {
@@ -174,7 +196,7 @@ android {
         }
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += managerAbis()
         }
     }
 
@@ -208,6 +230,8 @@ base {
 }
 
 dependencies {
+    implementation("com.android.tools.build:apksig:9.4.1")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.83")
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.core.splashscreen)
 

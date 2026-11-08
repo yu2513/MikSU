@@ -21,27 +21,27 @@ class KotlinSyntaxCheck {
             var root = Path.of(args[0]);
             List<Path> sources = new ArrayList<>();
             for (String relative : List.of(
-                "app/src/main/java/me/weishu/kernelsu/data/system",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/kpm"
+                "app/src/main/java/io/milksu/manager/data/system",
+                "app/src/main/java/io/milksu/manager/ui/screen/kpm"
             )) {
                 try (var paths = Files.walk(root.resolve(relative))) {
                     paths.filter(p -> p.toString().endsWith(".kt")).forEach(sources::add);
                 }
             }
             for (String relative : List.of(
-                "app/src/main/java/me/weishu/kernelsu/ui/viewmodel/KpmViewModel.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/viewmodel/SettingsViewModel.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/viewmodel/HomeViewModel.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/util/CoreManagerUpdater.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/viewmodel/MainActivityViewModel.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/MainActivity.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/navigation3/Routes.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMaterial.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsMiuix.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/settings/SettingsScreen.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/home/HomeScreen.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/home/HomeMaterial.kt",
-                "app/src/main/java/me/weishu/kernelsu/ui/screen/home/HomeMiuix.kt",
+                "app/src/main/java/io/milksu/manager/ui/viewmodel/KpmViewModel.kt",
+                "app/src/main/java/io/milksu/manager/ui/viewmodel/SettingsViewModel.kt",
+                "app/src/main/java/io/milksu/manager/ui/viewmodel/HomeViewModel.kt",
+                "app/src/main/java/io/milksu/manager/ui/util/CoreManagerUpdater.kt",
+                "app/src/main/java/io/milksu/manager/ui/viewmodel/MainActivityViewModel.kt",
+                "app/src/main/java/io/milksu/manager/ui/MainActivity.kt",
+                "app/src/main/java/io/milksu/manager/ui/navigation3/Routes.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/settings/SettingsMaterial.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/settings/SettingsMiuix.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/settings/SettingsScreen.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/home/HomeScreen.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/home/HomeMaterial.kt",
+                "app/src/main/java/io/milksu/manager/ui/screen/home/HomeMiuix.kt",
                 "app/build.gradle.kts", "build.gradle.kts"
             )) {
                 sources.add(root.resolve(relative));

@@ -292,7 +292,7 @@
     },
     {
       "path": "kernel/manager/throne_tracker.c",
-      "sha256": "c74f029a9d7d5f109028101a35cc1b4d7143a472b1caec6bf8abdb2d1fc50b07"
+      "sha256": "a28a1139218eac003b8f48e4f92ee57986d6d49e0d7fc4d5ae08929e3dc13ac0"
     },
     {
       "path": "kernel/policy/allowlist.c",
@@ -320,7 +320,7 @@
     },
     {
       "path": "kernel/runtime/boot_event.c",
-      "sha256": "0f5c95e7244fa02a3bd76a6abf32a1f1cde2be1ee415d10176ce8c90681ee25e"
+      "sha256": "5d0b4aaaa74d26d6a9e7d4eeb76fbb92eaf8b5ccb4aad50e3c735b90e729a02a"
     },
     {
       "path": "kernel/runtime/ksud_integration.c",

@@ -50,7 +50,7 @@ MilkSU 提供内核级 Root 授权、应用权限配置、模块管理、KPM 管
 
 从 [GitHub Releases](https://github.com/Xiaogugtfgdfhgrh/MikSU/releases/latest) 下载正式 APK 和 `SHA256SUMS`。
 
-当前正式包：`MilkSU_0.2.0_32800.apk`。下载后可在同一目录校验：
+当前正式包：`MilkSU_0.2.4_32804.apk`。下载后可在同一目录校验：
 
 ```sh
 sha256sum -c SHA256SUMS

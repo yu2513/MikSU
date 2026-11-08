@@ -25,7 +25,7 @@ $taskHamcrest = Find-CachedJar 'org.hamcrest' 'hamcrest-core' '1.3'
 $taskManager = Split-Path -Parent $PSScriptRoot
 $taskOutput = Join-Path $taskManager 'app/build/system-protocol-tests'
 New-Item -ItemType Directory -Path $taskOutput -Force | Out-Null
-$taskMain = Join-Path $taskManager 'app/src/main/java/me/weishu/kernelsu'
+$taskMain = Join-Path $taskManager 'app/src/main/java/io/milksu/manager'
 $taskSources = @(
     "$taskMain/data/model/MainTab.kt",
     "$taskMain/data/system/CoreUpdatePolicy.kt",
@@ -40,8 +40,8 @@ $taskSources = @(
     "$taskMain/ui/screen/home/HomeManagerUpdates.kt",
     "$taskMain/ui/util/module/LatestVersionInfo.kt"
 )
-$taskTests = Get-ChildItem -LiteralPath (Join-Path $taskManager 'app/src/test/java/me/weishu/kernelsu/data/system') -Filter '*Test.kt'
-$taskTests += Get-ChildItem -LiteralPath (Join-Path $taskManager 'app/src/test/java/me/weishu/kernelsu/ui/screen/home') -Filter '*Test.kt'
+$taskTests = Get-ChildItem -LiteralPath (Join-Path $taskManager 'app/src/test/java/io/milksu/manager/data/system') -Filter '*Test.kt'
+$taskTests += Get-ChildItem -LiteralPath (Join-Path $taskManager 'app/src/test/java/io/milksu/manager/ui/screen/home') -Filter '*Test.kt'
 $taskSources += $taskTests.FullName
 $taskCompilerClasspath = @($taskCompiler, $taskStdlib, $taskScript, $taskReflect, $taskTrove, $taskAnnotations, $taskCoroutines) -join [IO.Path]::PathSeparator
 $taskClasspath = @($taskStdlib, $taskAnnotations, $taskJson, $taskSerialization, $taskCoroutines, $taskJunit, $taskHamcrest) -join [IO.Path]::PathSeparator

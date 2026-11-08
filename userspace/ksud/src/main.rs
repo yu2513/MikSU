@@ -23,6 +23,8 @@ mod debug;
 mod defs;
 #[cfg(target_os = "android")]
 mod feature;
+#[cfg(any(target_os = "android", test))]
+mod feature_config;
 mod feature_id;
 #[cfg(target_os = "android")]
 mod hot_install;

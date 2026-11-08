@@ -25,7 +25,7 @@ jobs:
     env:
       MILKSU_CACHE: /opt/milksu
       MILKSU_JOBS: 2
-      MILKSU_ABIS: arm64-v8a
+      MILKSU_ABIS: 'arm64-v8a x86_64'
       MILKSU_DDK_RELEASE: '20260828'
       MILKSU_SIGNING_PROFILE: release
       MILKSU_REQUIRE_RELEASE_SIGNING: '1'
@@ -111,8 +111,16 @@ jobs:
           sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-host.sh
           sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" bash tools/build-release.sh snapshot --source-ready
           for stage in ksuinit ksud manager repack; do
-            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" MILKSU_ABIS=arm64-v8a MILKSU_REQUIRE_FULL_MATRIX="$MILKSU_REQUIRE_FULL_MATRIX" bash tools/build-release.sh "$stage"
+            sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" MILKSU_ABIS="$MILKSU_ABIS" MILKSU_REQUIRE_FULL_MATRIX="$MILKSU_REQUIRE_FULL_MATRIX" bash tools/build-release.sh "$stage"
           done
+
+      - name: Patch K80 init_boot images with 32804 kernel
+        shell: bash
+        run: |
+          chmod +x out/tools/ksud
+          mkdir -p out/boot
+          ./out/tools/ksud boot-patch-v2 --boot boot-images/init_boot_original.img --module out/aarch64/android14-6.1_kernelsu.ko --output out/boot/init_boot_systemcore.img --force
+          ./out/tools/ksud boot-patch-v2 --boot boot-images/init_boot_original.img --module out/aarch64/android14-6.1_kernelsu.ko --output out/boot/init_boot_systemcore_shell.img --force --allow-shell
 
       - name: Fix output permissions
         if: always()
@@ -124,10 +132,11 @@ jobs:
       - name: Upload MilkSU build products
         uses: actions/upload-artifact@v7
         with:
-          name: MilkSU-arm64
+          name: MilkSU-universal
           path: |
             out/manager/*.apk
             out/aarch64/*.ko
+            out/boot/*.img
             out/ksuinit/**
             out/ksud/**
             out/kpatch/**

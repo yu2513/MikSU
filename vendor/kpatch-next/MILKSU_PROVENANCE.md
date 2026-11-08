@@ -16,10 +16,13 @@ reboot: this ABI cannot prove that every hook, timer, work item, or other callba
 has drained. An exit error never frees code. A successful exit still returns
 `-EINPROGRESS` for unload and reports `pending_unload=1`.
 
-The capabilities supercall is `0x1033`. Its result is the bit mask `0x3f`:
+The optional MilkSU capabilities supercall is `0x1033`. Its result is the bit mask `0x3f`:
 bounded ELF, resident unload, serialized operations, state info, and bounded
-enumeration, plus the current MilkSU loader contract. The full mask is required;
-the engine version or one capability bit alone does not establish compatibility.
+enumeration, plus the current MilkSU loader contract. The full mask selects
+MilkSU's verified buffer-loading contract. Standard KPatch-Next returns
+`ENOSYS` for this extension and uses its original `0x1020` pathname-loading
+ABI instead; no capability bits are fabricated. Other probe failures and
+incomplete advertised MilkSU contracts remain errors.
 
 The early `base/map.c` bootstrap uses a volatile byte copy instead of struct
 assignment, preventing GCC from emitting an out-of-blob `memcpy` call before

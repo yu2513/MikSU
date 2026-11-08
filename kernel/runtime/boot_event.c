@@ -34,6 +34,8 @@ void on_post_fs_data(void)
 
     ksu_load_allow_list();
     ksu_observer_init();
+    // Existing packages need no packages.list update during this boot.
+    track_throne(false);
     // Sanity check for safe mode only needs early-boot input samples.
     ksu_stop_input_hook_runtime();
     ksu_selinux_hide_handle_post_fs_data();
@@ -78,7 +80,7 @@ void on_boot_completed(void)
         return;
     ksu_boot_completed = true;
     pr_info("on_boot_completed!\n");
-    track_throne(true);
+    track_throne(false);
     ksu_avc_spoof_late_init();
     ksu_feature_apply_forced();
     ksu_selinux_hide_drop_backup_if_unused();
