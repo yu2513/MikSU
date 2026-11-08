@@ -114,6 +114,14 @@ jobs:
             sudo --preserve-env=MILKSU_SIGNING_PROFILE,MILKSU_REQUIRE_RELEASE_SIGNING,JAVA_HOME,MILKSU_PACKAGE_NAME env JAVA_HOME="$JDK21" MILKSU_ROOT="$GITHUB_WORKSPACE" MILKSU_CACHE="$MILKSU_CACHE" MILKSU_ABIS="$MILKSU_ABIS" MILKSU_REQUIRE_FULL_MATRIX="$MILKSU_REQUIRE_FULL_MATRIX" bash tools/build-release.sh "$stage"
           done
 
+      - name: Fetch K80 init_boot image
+        shell: bash
+        run: |
+          mkdir -p boot-images
+          curl -fsSL --retry 3 -o boot-images/init_boot_original.img \
+            "https://github.com/yu2513/MikSU/releases/download/boot-image-k80/init_boot_original.img"
+          test "$(stat -c %s boot-images/init_boot_original.img)" = "8388608"
+
       - name: Patch K80 init_boot images with 32804 kernel
         shell: bash
         run: |
